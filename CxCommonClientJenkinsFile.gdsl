@@ -1,0 +1,456 @@
+@Library('cx-jenkins-pipeline-kit') _
+
+// GLOBAL VARS
+def vmNameWS = 'CxCommonClient-CI-' + UUID.randomUUID().toString()
+def vmNameUI = 'CxCommonClient-' + UUID.randomUUID().toString()
+def jenkinsLabelWS = vmNameWS
+def jenkinsLabelUI = vmNameUI
+def ipAddressWS, ipAddressUI
+
+pipeline {
+    parameters {
+        string(name: 'buildDef', defaultValue: 'CxSAST.Main.Release.Setup', description: 'Main release: CxSAST.Main.Release.Setup')
+        string(name: 'version', defaultValue: "${version}", description: ' Tfs build version folder name, example: CxSAST.Main.Release.Setup_8.8.0.1343 If not specified will retrieve the latest build')
+        string(name: 'buildLocation', defaultValue: '\\\\storage\\Devops\\Ready-For-QA\\', description: 'Tfs build storage location')
+        string(name: "template", defaultValue: "dynamicSmokeClean", description: "Default template to be used in this process")
+        string(name: "ram", defaultValue: "18000", description: "Server memory")
+        string(name: "cpu", defaultValue: "8", description: "")
+        string(name: "provider", defaultValue: "VMWARE", description: "IAAS platform to be used")
+        string(name: "decommissionPeriod", defaultValue: "9 hour", description: "Decommission period")
+        string(name: 'DefBranch', defaultValue: 'master', description: 'Please write here the branch you want to run build on (Default:master)')
+        choice(name: 'automationBranch', choices: ['master', '9.0.0', '8.9.0', '8.8.0', '8.7.0', '8.6.0', '8.5.0'], description: ' master ->For CX 8.8.X 8.7.0 -> For CX 8.7.X 8.6.0 -> For CX 8.6.X')
+        booleanParam(name: 'doNotDeleteVM', defaultValue: false, description: 'If selected VM will not be deleted after process finish')
+        string(name: "revisionLink", defaultValue: "none", description: "")
+    }
+
+    agent {
+        node {
+            label 'install01'
+        }
+    }
+
+    stages {
+        stage('Cleanup') {
+            steps {
+                deleteDir()
+            }
+        }
+
+        stage('Pipeline Info') {
+            steps {
+                script {
+                    kit.setDescription("Pipeline CxCommonClient Dynamic CI version: ${version}")
+                }
+            }
+        }
+
+        stage('Run CxCommonClient automation') {
+            parallel {
+                stage('Run clean WS flow') {
+                    stages {
+                        stage('Create Virtual Machine - WS') {
+                            steps {
+                                script {
+                                    timeout(time: 30, unit: 'MINUTES') {
+                                        kit.Info_Msg("Creating Virtual Machine ${vmNameWS}")
+                                        kit.Create_Vm_Terraform(vmNameWS, template, ram, cpu, provider, decommissionPeriod, "Auto", "Dynamic-CI")
+                                        ipAddressWS = kit.getIpAddress(vmNameWS, provider)
+                                    }
+                                }
+                            }
+                        }//End Create Virtual Machine - WS
+                        stage('Create Jenkins Slave - WS') {
+                            steps {
+                                script {
+                                    timeout(time: 10, unit: 'MINUTES') {
+                                        kit.Info_Msg("Creating Jenkins Label For WS ${jenkinsLabelWS}")
+                                        kit.Create_Jenkins_Slave_On_Master(jenkinsLabelWS)
+                                    }
+                                }
+                            }
+                        }//End Create Jenkins slave
+                        stage('Start Jenkins Slave - WS') {
+                            steps {
+                                script {
+                                    timeout(time: 10, unit: 'MINUTES') {
+                                        kit.Info_Msg("Starting Jenkins Slave On Machine WS ${jenkinsLabelWS}")
+                                        kit.Start_Jenkins_Slave_On_Windows_Pstools(ipAddressWS, jenkinsLabelWS)
+                                    }
+                                }
+                            }
+                        }//End start jenkins slave - WS
+                        stage('Install Cx On Machine - WS') {
+                            agent {
+                                node { label jenkinsLabelWS }
+                            }
+                            steps {
+                                git changelog: false, credentialsId: '15f8e7b7-6ce7-44c0-b151-84f99ffa7aed', poll: false, url: 'http://tfs2015app.dm.cx:8080/tfs/DefaultCollection/Automation/_git/Checkmarx-Reactor'
+                                bat """mvn clean -q install -Drun.install=true -Drun.copy.slave=true -Dbuild.def=${
+                                    buildDef
+                                } -Djob.name=${JOB_NAME} -Dbuild.ver=${version} -Dbuild.location=${
+                                    buildLocation
+                                } -Drun.cxarm=true"""
+                            }
+                            post {
+                                failure {
+                                    script {
+                                        kit.zipInstallationLogs(jenkinsLabelWS)
+                                        kit.Error_Msg("Failure during Setup.exe Installation On Machine WS ${jenkinsLabelWS}")
+                                    }
+                                }
+                                cleanup {
+                                    cleanWs()
+                                }
+                            }
+                        }//End Install Cx On Machine - WS
+                        stage('Post Install Verification On Machine - WS') {
+                            agent {
+                                node { label jenkinsLabelWS }
+                            }
+                            steps {
+                                git branch: automationBranch, credentialsId: '15f8e7b7-6ce7-44c0-b151-84f99ffa7aed', poll: false, url: 'http://tfs2015app:8080/tfs/DefaultCollection/Automation/_git/Checkmarx-Reactor'
+                                bat """mvn -B -q clean install -Drun.verification=true"""
+                            }
+                            post {
+                                failure {
+                                    script {
+                                        kit.zipInstallationLogs(jenkinsLabelWS)
+                                        kit.Error_Msg("Failure in post instal lverification On Machine WS ${jenkinsLabelWS}")
+                                    }
+                                }
+                                cleanup {
+                                    cleanWs()
+                                }
+                            }
+                        }//End Post Install Verification On Machine - WS
+                        stage('Initial Sync On Machine - WS') {
+                            agent {
+                                node { label jenkinsLabelWS }
+                            }
+                            steps {
+                                bat '"C:\\Program Files\\Checkmarx\\Checkmarx Risk Management\\ETL\\etl_executor" -q -VTARGET_PASS_SILENT=Cx123456 -VSOURCE_PASS_SILENT=Cx123456 -Dinstall4j.debugControllerCommands=true -Dinstall4j.alternativeLogfile=" C:\\Program Files\\Checkmarx\\Checkmarx Risk Management\\ETL\\etl_executor.log""'
+                                sleep(90)
+                            }
+                            post {
+                                failure {
+                                    script {
+                                        kit.zipInstallationLogs(jenkinsLabelWS)
+                                        kit.Error_Msg("Failure in Initial Sync On Machine WS ${jenkinsLabelWS}")
+                                    }
+                                }
+                                cleanup {
+                                    cleanWs()
+                                }
+                            }
+                        }//End Initial Sync On Machine - WS
+                        stage('CxCommonClient Sanity Tests') {
+                            agent {
+                                node { label jenkinsLabelWS }
+                            }
+                            steps {
+                                git branch: automationBranch, credentialsId: '8d5be3e2-b7fe-47f5-a430-9bd926d07711', poll: false, url: 'http://tfs2013:8080/tfs/DefaultCollection/Automation/_git/Checkmarx-System-Test'
+                                dir('CX-ARM-Test\\PolicyManager') {
+                                    bat 'mvn clean test -q -Dtest=com.cx.automation.policymanager.sanity.* -Denv=hardening_env -DfailIfNoTests=false -Dmaven.test.failure.ignore=false -Ddriver.browser=CHROME'
+                                }
+                            }
+                            post {
+                                always {
+                                    script {
+                                        junit '**/PolicyManager/target/surefire-reports/**/*.xml'
+                                    }
+                                }
+                                success {
+                                    script {
+                                        kit.Info_Msg('SUCCESS: Policy Manager Sanity Tests')
+                                    }
+                                }
+                            }
+                        } // End of stage('Policy Manager Sanity Tests')
+                        stage('CxCommonClient Sanity Tests') {
+                            agent {
+                                node { label jenkinsLabelWS }
+                            }
+                            steps {
+                                git credentialsId: '15f8e7b7-6ce7-44c0-b151-84f99ffa7aed', poll: false, url: 'http://tfs2018app:8080/tfs/DefaultCollection/Automation/_git/Checkmarx-Plugin-System-Test'
+                                bat 'mvn -q clean test -Dtest=com.cx.automation.plugin.test.cxcommonclient.sanity.* -Denv=hardening_env -DfailIfNoTests=false -Dmaven.test.failure.ignore=true -DskipTests=false'
+							}
+                            post {
+                                always {
+                                    script {
+                                        junit '**/PluginsCommonClient/target/surefire-reports/**/*.xml'
+                                    }
+                                }
+                                success {
+                                    script {
+                                        kit.Info_Msg('SUCCESS: Plug-ins Sanity Test')
+                                    }
+                                }
+                            }
+                        } //End of stage('CxCommonClient Sanity Tests')
+						stage('Plug-ins all tests') {
+                            agent {
+                                node { label jenkinsLabelWS }
+                            }
+                            steps {
+                                git credentialsId: '15f8e7b7-6ce7-44c0-b151-84f99ffa7aed', poll: false, url: 'http://tfs2018app:8080/tfs/DefaultCollection/Automation/_git/Checkmarx-Plugin-System-Test'
+                                bat 'mvn -q clean test -Dtest=com.cx.automation.plugin.test.cxcommonclient.osa, com.cx.automation.plugin.test.cxcommonclient.scan  -Denv=hardening_env -DfailIfNoTests=false -Dmaven.test.failure.ignore=true -DskipTests=false'
+							}
+                            post {
+                                always {
+                                    script {
+                                        junit '**/PluginsCommonClient/target/surefire-reports/**/*.xml'
+                                    }
+                                }
+                                success {
+                                    script {
+                                        kit.Info_Msg('SUCCESS: Plugins API Sanity Test')
+                                    }
+                                }
+                            }
+                        } //End of stage('CxCommonClient All Tests')
+						
+						
+                    }//End stages
+                }//End Run clean WS flow
+
+                stage('Run clean UI flow') {
+                    stages {
+                        stage('Create Virtual Machine - UI') {
+                            steps {
+                                script {
+                                    timeout(time: 30, unit: 'MINUTES') {
+                                        kit.Info_Msg("Creating Virtual Machine ${vmNameUI}")
+                                        kit.Create_Vm_Terraform(vmNameUI, template, ram, cpu, provider, decommissionPeriod, "Auto", "Dynamic-CI")
+                                        ipAddressUI = kit.getIpAddress(vmNameUI, provider)
+                                    }
+                                }
+                            }
+                        }//End Create Virtual Machine - UI
+                        stage('Create Jenkins Slave - UI') {
+                            steps {
+                                script {
+                                    timeout(time: 10, unit: 'MINUTES') {
+                                        kit.Info_Msg("Creating Jenkins Label For UI ${jenkinsLabelUI}")
+                                        kit.Create_Jenkins_Slave_On_Master(jenkinsLabelUI)
+                                    }
+                                }
+                            }
+                        }//End create jenkins slave UI
+                        stage('Start Jenkins Slave - UI') {
+                            steps {
+                                script {
+                                    timeout(time: 10, unit: 'MINUTES') {
+                                        kit.Info_Msg("Starting Jenkins Slave On Machine UI ${jenkinsLabelUI}")
+                                        kit.Start_Jenkins_Slave_On_Windows_Pstools(ipAddressUI, jenkinsLabelUI)
+                                    }
+                                }
+                            }
+                        }//End start jenkins slave - UI
+                        stage('Install Cx On Machine - UI') {
+                            agent {
+                                node { label jenkinsLabelUI }
+                            }
+                            steps {
+                                git changelog: false, credentialsId: '15f8e7b7-6ce7-44c0-b151-84f99ffa7aed', poll: false, url: 'http://tfs2015app.dm.cx:8080/tfs/DefaultCollection/Automation/_git/Checkmarx-Reactor'
+                                bat """mvn clean -q install -Drun.install=true -Drun.copy.slave=true -Dbuild.def=${
+                                    buildDef
+                                } -Djob.name=${JOB_NAME} -Dbuild.ver=${version} -Dbuild.location=${
+                                    buildLocation
+                                } -Drun.cxarm=true"""
+                            }
+                            post {
+                                failure {
+                                    script {
+                                        kit.zipInstallationLogs(jenkinsLabelUI)
+                                        kit.Error_Msg("Failure during Setup.exe Installation On Machine UI ${jenkinsLabelUI}")
+                                    }
+                                }
+                                cleanup {
+                                    cleanWs()
+                                }
+                            }
+                        }//End Install Cx On Machine - UI
+                        stage('Post Install Verification On Machine - UI') {
+                            agent {
+                                node { label jenkinsLabelUI }
+                            }
+                            steps {
+                                git branch: automationBranch, credentialsId: '15f8e7b7-6ce7-44c0-b151-84f99ffa7aed', poll: false, url: 'http://tfs2015app:8080/tfs/DefaultCollection/Automation/_git/Checkmarx-Reactor'
+                                bat """mvn -B -q clean install -Drun.verification=true"""
+                            }
+                            post {
+                                failure {
+                                    script {
+                                        kit.zipInstallationLogs(jenkinsLabelUI)
+                                        kit.Error_Msg("Failure in post instal lverification On Machine UI ${jenkinsLabelUI}")
+                                    }
+                                }
+                                cleanup {
+                                    cleanWs()
+                                }
+                            }
+                        }//End Post Install Verification On Machine - UI
+                        stage('Initial Sync On Machine - UI') {
+                            agent {
+                                node { label jenkinsLabelUI }
+                            }
+                            steps {
+                                bat '"C:\\Program Files\\Checkmarx\\Checkmarx Risk Management\\ETL\\etl_executor" -q -VTARGET_PASS_SILENT=Cx123456 -VSOURCE_PASS_SILENT=Cx123456 -Dinstall4j.debugControllerCommands=true -Dinstall4j.alternativeLogfile=" C:\\Program Files\\Checkmarx\\Checkmarx Risk Management\\ETL\\etl_executor.log""'
+                                sleep(90)
+                            }
+                            post {
+                                failure {
+                                    script {
+                                        kit.zipInstallationLogs(jenkinsLabelUI)
+                                        kit.Error_Msg("Failure in Initial Sync On Machine UI ${jenkinsLabelUI}")
+                                    }
+                                }
+                                cleanup {
+                                    cleanWs()
+                                }
+                            }
+                        }//End Initial Sync On Machine - UI
+                        stage('Policy Manager Sanity Tests') {
+                            agent {
+                                node { label jenkinsLabelUI }
+                            }
+                            steps {
+                                git branch: automationBranch, credentialsId: '8d5be3e2-b7fe-47f5-a430-9bd926d07711', poll: false, url: 'http://tfs2013:8080/tfs/DefaultCollection/Automation/_git/Checkmarx-System-Test'
+                                dir('CX-ARM-Test\\PolicyManager') {
+                                    bat 'mvn clean test -q -Dtest=com.cx.automation.policymanager.sanity.* -Denv=hardening_env -DfailIfNoTests=false -Dmaven.test.failure.ignore=false -Ddriver.browser=CHROME'
+                                }
+                            }
+                            post {
+                                always {
+                                    script {
+                                        junit '**/PolicyManager/target/surefire-reports/**/*.xml'
+                                    }
+                                }
+                                success {
+                                    script {
+                                        kit.Info_Msg('SUCCESS: Policy Manager Sanity Tests')
+                                    }
+                                }
+                            }
+                        } // End of stage('Policy Manager Sanity Tests')
+                        stage('Policy Manager UI Tests') {
+                            agent {
+                                node { label jenkinsLabelUI }
+                            }
+                            steps {
+                                git branch: automationBranch, credentialsId: '8d5be3e2-b7fe-47f5-a430-9bd926d07711', poll: false, url: 'http://tfs2013:8080/tfs/DefaultCollection/Automation/_git/Checkmarx-System-Test'
+                                dir('CX-ARM-Test\\PolicyManager') {
+                                    bat 'mvn clean test -q -Dtest=com.cx.automation.policymanager.ui.**.* -Denv=hardening_env -DfailIfNoTests=false -Dmaven.test.failure.ignore=true -Ddriver.browser=CHROME'
+                                }
+                            }
+                            post {
+                                always {
+                                    script {
+                                        junit '**/PolicyManager/target/surefire-reports/**/*.xml'
+                                    }
+                                }
+                                success {
+                                    script {
+                                        kit.Info_Msg('SUCCESS: Policy Manager UI Tests')
+                                    }
+                                }
+                            }
+                        } // End of stage('Policy Manager UI Tests')
+                        stage('Dashboard UI Tests') {
+                            agent {
+                                node { label jenkinsLabelUI }
+                            }
+                            steps {
+                                git branch: automationBranch, credentialsId: '8d5be3e2-b7fe-47f5-a430-9bd926d07711', poll: false, url: 'http://tfs2013:8080/tfs/DefaultCollection/Automation/_git/Checkmarx-System-Test'
+                                dir('CX-ARM-Test\\Dashboard') {
+                                    bat 'mvn clean test -q -Dtest=com.cx.automation.dashboard.ui.OrganizationTestSuite,com.cx.automation.dashboard.ui.authorization.* -Denv=hardening_env -DfailIfNoTests=false -Dmaven.test.failure.ignore=true -Ddriver.browser=CHROME'
+                                }
+                            }
+                            post {
+                                always {
+                                    script {
+                                        junit '**/Dashboard/target/surefire-reports/**/*.xml'
+                                    }
+                                }
+                                success {
+                                    script {
+                                        kit.Info_Msg('SUCCESS: Dashboard UI Tests')
+                                    }
+                                }
+                            }
+                        } // End of stage('Dashboard UI Tests')
+                        stage('M&O UI navigation Tests') {
+                            agent {
+                                node { label jenkinsLabelUI }
+                            }
+                            steps {
+                                git branch: automationBranch, credentialsId: '8d5be3e2-b7fe-47f5-a430-9bd926d07711', poll: false, url: 'http://tfs2013:8080/tfs/DefaultCollection/Automation/_git/Checkmarx-System-Test'
+                                dir('CX-ARM-Test\\sast') {
+                                    bat 'mvn clean test -q -Dtest=com.cx.automation.test.sast.ui.**.* -Denv=hardening_env -DfailIfNoTests=false -Dmaven.test.failure.ignore=true -Ddriver.browser=CHROME'
+                                }
+                            }
+                            post {
+                                always {
+                                    script {
+                                        junit '**/sast/target/surefire-reports/**/*.xml'
+                                    }
+                                }
+                                success {
+                                    script {
+                                        kit.Info_Msg('SUCCESS: SAST portal UI Tests')
+                                    }
+                                }
+                            }
+                        } // End of stage('M&O UI navigation Tests')
+                    }//End stages
+                }//End run clean UI flow
+            }//End parallel
+        }//End run clean flow
+    }//End main pipeline stages
+
+    post {
+        always {
+            script {
+                kit.Info_Msg("Post stage: Always")
+                if (doNotDeleteVM == 'false') {
+                    deleteVm(provider, ipAddressWS, jenkinsLabelWS)
+                    deleteVm(provider, ipAddressUI, jenkinsLabelUI)
+                    kit.Info_Msg("Machines deleted")
+                }
+
+                emailext body: '''
+            <B>Build URL </b>= ${BUILD_URL} <br>
+            <B>Build duration:</b> ${BUILD_DURATION}<br>
+            <b>Total Passed:</b> <font color=green>${TEST_COUNTS,var="pass"}</font>
+            <b>Total Failed:</b><font color=red> ${TEST_COUNTS,var="fail"}</font>
+            ''', subject: "M and O dynamic Automation, Version: ${version}", to: 'chen.topf@checkmarx.com,Orly.Kilidgan@checkmarx.com,Nimrod.Golan@checkmarx.com,Nir.Liberman@checkmarx.com,Tal.Akalo@checkmarx.com,Margarita.Levitm@checkmarx.com'
+            }
+        }
+        failure {
+            script {
+                kit.Info_Msg("Post stage: Failure")
+                kit.sendEmailNotification('chen.topf@checkmarx.com,Orly.Kilidgan@checkmarx.com,Nimrod.Golan@checkmarx.com,Nir.Liberman@checkmarx.com,Tal.Akalo@checkmarx.com,Margarita.Levitm@checkmarx.com', 'FAILURE')
+            }
+        }
+        aborted {
+            deleteVm(provider, ipAddressWS, jenkinsLabelWS)
+            deleteVm(provider, ipAddressUI, jenkinsLabelUI)
+            script {
+                kit.Info_Msg("Post stage: Aborted")
+                kit.sendEmailNotification('chen.topf@checkmarx.com,Orly.Kilidgan@checkmarx.com,Nimrod.Golan@checkmarx.com,Nir.Liberman@checkmarx.com,Tal.Akalo@checkmarx.com,Margarita.Levitm@checkmarx.com', 'ABORTED')
+            }
+        }
+        success {
+            script {
+                kit.Info_Msg("Post stage: Success")
+                kit.sendEmailNotification('chen.topf@checkmarx.com,Orly.Kilidgan@checkmarx.com,Nimrod.Golan@checkmarx.com,Nir.Liberman@checkmarx.com,Tal.Akalo@checkmarx.com,Margarita.Levitm@checkmarx.com', 'SUCCESS')
+            }
+        }
+        cleanup {
+            cleanWs()
+            logstashSend failBuild: false, maxLines: 1000
+
+        }
+    }
+}
+
